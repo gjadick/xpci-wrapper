@@ -45,17 +45,15 @@ class Material:
         self.tmap = None
 
     def get_dbm(self, energy):   # delta, beta, mu 
-        d, b, m = get_dbm_mix(self.matcomp, energy, self.density)
+        self.energy = np.array(energy, dtype=np.float32).ravel()
+        d, b, m = get_dbm_mix(self.matcomp, self.energy, self.density)
         self.delta = d
         self.beta = b
         self.mu = m
-        self.energy = energy
         return d, b, m
     
     def assign_tmap(self, tmap):  # depends on chosen geometry
         self.tmap = tmap
-        if self.energy is not None:
-            self.get_db_proj()
         return None
 
     def get_db_proj(self):  # must have called get_dbm and assign_tmap already!
@@ -101,11 +99,12 @@ class Geometry:
 
 
 class Spectrum:
-    def __init__(self, energies, counts):
-        self.E = np.array(energies)
-        self.I0 = np.array(counts)   # photons per detector pixel -- not scaled to pixel size!!
+    def __init__(self, energies, counts=1.0):
+        self.E = np.array(energies, dtype=np.float32).ravel()
+        self.I0 = np.array(counts, dtype=np.float32).ravel()   # photons per detector pixel -- not scaled to pixel size!!
         assert len(self.E) == len(self.I0)
         self.size = self.E.size
+        self.E_eff = np.average(energies, weights=counts)
 
 
 def tmap_rect(geometry, L, xc, yc, rx, ry, upsampled=True):
@@ -194,7 +193,10 @@ def tmap_ellipsoid(geometry, L, xc, yc, rx, ry, upsampled=True):
 
 
 def simdata_polychrom(materials, spectrum, geo, propdists, normalize=True,
-                      processes=PROCESSES, device=DEVICE):  
+                      processes=1, device='cpu'):  
+    """
+    Works for polychcromatic or monochromatic x-ray spectra.
+    """
     try:
         len(materials)
     except:
@@ -206,6 +208,7 @@ def simdata_polychrom(materials, spectrum, geo, propdists, normalize=True,
     except:
         propdists = [propdists]  # check, only one propagation distance
     Ndists = len(propdists)
+    propdists = np.array(propdists)
 
     # Create the delta and beta line integral projections at all spectrum energies. 
     delta_proj_polychrom = np.zeros([spectrum.size, geo.Nx_upx, geo.Nx_upx], dtype=np.float32)
@@ -213,9 +216,10 @@ def simdata_polychrom(materials, spectrum, geo, propdists, normalize=True,
     for mat in materials:
         assert geo.Nx_upx == mat.tmap.shape[0]
         assert geo.Nx_upx == mat.tmap.shape[1]
+        mat.get_dbm(spectrum.E)
         delta_proj, beta_proj = mat.get_db_proj()
         delta_proj_polychrom += delta_proj
-        beta_proj_polychrom = beta_proj
+        beta_proj_polychrom += beta_proj
 
     # Simulate the images at all propagation distances.
     imgs_all = np.zeros([Ndists, geo.Nx, geo.Nx], dtype=np.float32)
@@ -225,7 +229,9 @@ def simdata_polychrom(materials, spectrum, geo, propdists, normalize=True,
         beta_proj = beta_proj_polychrom[i]
 
         # initial monochromatic simulation (all propdists at once)
-        rads = simdata(delta_proj, beta_proj, geo.dx, energy, propdists, processes=PROCESSES, device=DEVICE)
+        c = 1e3  # scale m --> mm. This improves phasetorch simdata() runtime
+        rads = simdata(c*delta_proj, c*beta_proj, c*geo.dx_upx, energy, c*propdists, processes, device)
+        # rads = simdata(delta_proj, beta_proj, geo.dx_upx, energy, propdists, processes, device)
         rads = downscale_local_mean(rads, factors=(1, 1, geo.upx, geo.upx))
 
         # iterate over the distances for post-processing
@@ -237,12 +243,13 @@ def simdata_polychrom(materials, spectrum, geo, propdists, normalize=True,
     
     # Convolve with detector PSF after all photons at all energies have been counted.
     for i in range(len(propdists)):
-        imgs_all[i] = convolve2d(imgs_all[i], geo.psf, mode='same', boundary='fill', fillvalue=np.sum(spec.I0))
+        imgs_all[i] = convolve2d(imgs_all[i], geo.psf, mode='same', boundary='fill', fillvalue=np.sum(spectrum.I0))
 
     if normalize:
-        imgs_all /= np.sum(spec.I0)
+        imgs_all /= np.sum(spectrum.I0)
 
     return imgs_all
+
 
 
 
@@ -261,7 +268,7 @@ if __name__ == '__main__':   # testing
     geo.assign_noise(noise_perc=0.4)
     geo.assign_lorentzian_psf(fwhm=px_sz)
 
-    # polychromatic x-ray spectrum
+    # polychromatic x-ray spectrum -- arbitrary testing spec
     E = np.array([14, 16, 18, 20], dtype=np.float32)
     I0 = np.array([1, 1.2, 1.8, 1.1], dtype=np.float32)
     spec = Spectrum(E, I0)
@@ -327,6 +334,8 @@ if __name__ == '__main__':   # testing
         delta_proj = np.zeros([spec.size, geo.Nx_upx, geo.Nx_upx], dtype=np.float32)
         beta_proj = np.zeros([spec.size, geo.Nx_upx, geo.Nx_upx], dtype=np.float32)
         for mat in materials:
+            mat.get_dbm(spec.E)
+            mat.get_db_proj()
             delta_proj += mat.delta_proj
             beta_proj += mat.beta_proj
 
@@ -364,7 +373,7 @@ if __name__ == '__main__':   # testing
                 im = axs[i].imshow(rads[i], **kw)
                 axs[i].set_title("Distance {}".format(propdists[i]))
                 fig.colorbar(im, ax=axs[i], orientation="horizontal")
-            axs[-1].plot(spec.E, spec.I0)
+            axs[-1].plot(spec.E, spec.I0, 'ko-')
             axs[-1].set_xlabel('[keV]')
             axs[-1].set_title('energy spectrum')
             fig.suptitle('Polychromatic test', fontweight='bold')
